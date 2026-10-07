@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=planto-2" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Planto.</title>
+
+    <link rel="stylesheet" href="/src/index.css" />
+    <meta
+      name="description"
+      content="Plants chosen for small rooms and short attention spans — packed carefully, delivered alive."
+    />
+    <meta name="theme-color" content="#222c1d" />
+
+    <link
+      rel="preload"
+      as="image"
+      type="image/avif"
+      imagesrcset="/images/hero-bg-960.avif 960w, /images/hero-bg-1920.avif 1920w"
+      imagesizes="100vw"
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap"
+      media="print"
+      onload="this.media = 'all'"
+    />
+  </head>
+  <body>
+    <div id="root">
+      <div aria-hidden="true" class="app-shell">
+        <div class="app-shell__header"><span class="app-shell__brand">Planto.</span></div>
+        <picture class="app-shell__hero" data-shell-route="/">
+          <source
+            type="image/avif"
+            srcset="/images/hero-bg-960.avif 960w, /images/hero-bg-1920.avif 1920w"
+            sizes="100vw"
+          />
+          <source
+            type="image/webp"
+            srcset="/images/hero-bg-960.webp 960w, /images/hero-bg-1920.webp 1920w"
+            sizes="100vw"
+          />
+          <img src="/images/hero-bg.jpg" alt="" width="1920" height="1080" fetchpriority="high" />
+        </picture>
+      </div>
+    </div>
+    <script>
+      if (location.pathname !== '/') document.querySelector('[data-shell-route="/"]')?.remove();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

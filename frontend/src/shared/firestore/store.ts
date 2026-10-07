@@ -1,0 +1,473 @@
+import { catalogPrice } from './catalog-prices';
+import type { FetchArgs } from '@reduxjs/toolkit/query';
+import {
+  Bytes,
+  collection,
+  doc,
+  getDoc,
+  getDocs,
+  getFirestore,
+  runTransaction,
+  setDoc,
+  writeBatch,
+} from 'firebase/firestore';
+import { firebaseApp } from '../config/firebase';
+import seed from './seed.json';
+import type { ProductVariant, ProductDelivery } from '../commerce';
+
+interface Product {
+  id: string;
+  slug: string;
+  name: { en: string; ru: string };
+  description: { en: string; ru: string };
+  price: number;
+  currency: 'AZN';
+  category: string;
+  care?: {
+    light: 'low' | 'bright' | 'direct';
+    watering: 'dry' | 'top-dry' | 'moist';
+    size: 'compact' | 'medium' | 'large';
+    effort: 'easy' | 'regular';
+    humidity: 'average' | 'high';
+    pets: 'safe' | 'toxic' | 'unknown';
+  };
+  variants?: ProductVariant[];
+  delivery?: ProductDelivery;
+  imageUrl: string;
+  gallery?: string[];
+  status?: 'published' | 'draft' | 'archived';
+  inStock: boolean;
+  createdAt: string;
+}
+
+type ProductDraft = Omit<Product, 'id' | 'createdAt'>;
+type ProductPatch = Partial<ProductDraft>;
+
+const database = getFirestore(firebaseApp);
+const ADMIN_EMAIL = 'bagirzadeayaz2005@gmail.com';
+const seededCare = new Map(seed.products.map(({ id, care }) => [id, care as Product['care']]));
+const seededCommerce = new Map(
+  seed.products.map((product) => [
+    product.id,
+    {
+      price: product.price,
+      variants: product.variants as ProductVariant[],
+      delivery: product.delivery as ProductDelivery,
+    },
+  ]),
+);
+
+const toSlug = (value: string): string =>
+  value
+    .toLowerCase()
+    .normalize('NFKD')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 100)
+    .replace(/-+$/, '');
+
+const asParams = (value: FetchArgs['params']): URLSearchParams => {
+  const params = new URLSearchParams();
+  if (!value) return params;
+  for (const [key, item] of Object.entries(value)) {
+    if (item !== undefined && item !== null) params.set(key, String(item));
+  }
+  return params;
+};
+
+const positive = (value: string | null, fallback: number): number => {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const nonNegative = (value: string | null): number | null => {
+  if (value === null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+};
+
+const resolveStoredImage = async (imageUrl: string): Promise<string> => {
+  const match = /^\/api\/images\/([a-f0-9]{64})$/.exec(imageUrl);
+  if (!match?.[1]) return imageUrl;
+  const snapshot = await getDoc(doc(database, 'images', match[1]));
+  if (!snapshot.exists()) return imageUrl;
+  const data = snapshot.data() as { bytes?: Bytes; contentType?: string };
+  if (!(data.bytes instanceof Bytes) || !data.contentType) return imageUrl;
+  const bytes = data.bytes.toUint8Array();
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `data:${data.contentType};base64,${btoa(binary)}`;
+};
+
+const prepareImage = async (
+  imageUrl: string,
+): Promise<{ url: string; hash?: string; bytes?: Bytes; contentType?: string }> => {
+  if (!imageUrl.startsWith('data:')) return { url: imageUrl };
+  const match = /^data:(image\/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/.exec(
+    imageUrl,
+  );
+  if (!match?.[1] || !match[2]) throw new Error('Invalid image data');
+  const raw = atob(match[2]);
+  const bytes = Uint8Array.from(raw, (character) => character.charCodeAt(0));
+  if (bytes.length === 0 || bytes.length > 300 * 1024) throw new Error('Invalid image size');
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  const hash = [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+  return {
+    url: `/api/images/${hash}`,
+    hash,
+    bytes: Bytes.fromUint8Array(bytes),
+    contentType: match[1],
+  };
+};
+
+const productFrom = async (id: string, data: Omit<Product, 'id'>): Promise<Product> => {
+  const care = data.care ?? seededCare.get(id);
+  const price = data.status ? data.price : catalogPrice(data.slug, data.price);
+  const seeded = seededCommerce.get(id);
+  const variants =
+    data.variants ??
+    seeded?.variants.map((variant) => ({
+      ...variant,
+      price: Math.max(0, variant.price + price - seeded.price),
+    })) ??
+    [];
+  return {
+    ...data,
+    id,
+    ...(care ? { care } : {}),
+
+    currency: 'AZN',
+    price: variants.length ? Math.min(...variants.map((variant) => variant.price)) : price,
+    variants: await Promise.all(
+      variants.map(async (variant) => ({
+        ...variant,
+        imageUrl: await resolveStoredImage(variant.imageUrl),
+      })),
+    ),
+    delivery: data.delivery ??
+      seeded?.delivery ?? { areas: ['baku', 'absheron', 'regions'], dispatchDays: 0 },
+    imageUrl: await resolveStoredImage(data.imageUrl),
+    gallery: await Promise.all((data.gallery ?? []).map(resolveStoredImage)),
+    status: data.status ?? 'published',
+  };
+};
+
+const listProducts = async (params: URLSearchParams) => {
+  const snapshots = await getDocs(collection(database, 'products'));
+  const products = await Promise.all(
+    snapshots.docs.map((snapshot) =>
+      productFrom(snapshot.id, snapshot.data() as Omit<Product, 'id'>),
+    ),
+  );
+  const search = (params.get('search') ?? '').trim().toLowerCase();
+  const category = params.get('category');
+  const minPrice = nonNegative(params.get('minPrice'));
+  const maxPrice = nonNegative(params.get('maxPrice'));
+  const inStock = params.get('inStock') === 'true';
+  const sort = params.get('sort') ?? 'newest';
+  const page = positive(params.get('page'), 1);
+  const perPage = Math.min(positive(params.get('perPage'), 6), 100);
+  const comparators: Record<string, (a: Product, b: Product) => number> = {
+    newest: (a, b) => b.createdAt.localeCompare(a.createdAt),
+    'price-asc': (a, b) => a.price - b.price,
+    'price-desc': (a, b) => b.price - a.price,
+    'name-asc': (a, b) => a.name.en.localeCompare(b.name.en),
+  };
+  const filtered = products
+    .filter((product) => {
+      if (category && product.category !== category) return false;
+      if (minPrice !== null && !(product.price >= minPrice)) return false;
+      if (maxPrice !== null && !(product.price <= maxPrice)) return false;
+      if (inStock && !product.inStock) return false;
+      return (
+        search === '' ||
+        product.name.en.toLowerCase().includes(search) ||
+        product.name.ru.toLowerCase().includes(search)
+      );
+    })
+    .sort(comparators[sort] ?? comparators.newest);
+  const start = (page - 1) * perPage;
+  return { items: filtered.slice(start, start + perPage), total: filtered.length, page, perPage };
+};
+
+const findProduct = async (key: string): Promise<Product> => {
+  let snapshot = await getDoc(doc(database, 'products', key));
+  if (!snapshot.exists()) {
+    const mapping = await getDoc(doc(database, 'productSlugs', key));
+    if (mapping.exists())
+      snapshot = await getDoc(doc(database, 'products', String(mapping.data().productId)));
+  }
+  if (!snapshot.exists()) {
+    throw new Error('Product not found');
+  }
+  return productFrom(snapshot.id, snapshot.data() as Omit<Product, 'id'>);
+};
+
+const listAdminProducts = async (): Promise<Product[]> => {
+  const [published, workspace] = await Promise.all([
+    getDocs(collection(database, 'products')),
+    getDocs(collection(database, 'productWorkspace')),
+  ]);
+  return Promise.all(
+    [...published.docs, ...workspace.docs].map((item) =>
+      productFrom(item.id, item.data() as Omit<Product, 'id'>),
+    ),
+  );
+};
+
+const findAdminProduct = async (id: string): Promise<Product> => {
+  const publicDoc = await getDoc(doc(database, 'products', id));
+  const snapshot = publicDoc.exists()
+    ? publicDoc
+    : await getDoc(doc(database, 'productWorkspace', id));
+  if (!snapshot.exists()) throw new Error('Product not found');
+  return productFrom(snapshot.id, snapshot.data() as Omit<Product, 'id'>);
+};
+
+const saveProduct = async (
+  id: string,
+  patch: ProductPatch,
+  creating: boolean,
+): Promise<Product> => {
+  const prepared = patch.imageUrl === undefined ? null : await prepareImage(patch.imageUrl);
+  const gallery =
+    patch.gallery === undefined ? null : await Promise.all(patch.gallery.map(prepareImage));
+  const variants =
+    patch.variants === undefined
+      ? null
+      : await Promise.all(
+          patch.variants.map(async (variant) => ({
+            variant,
+            image: await prepareImage(variant.imageUrl),
+          })),
+        );
+  const images = [
+    ...(prepared ? [prepared] : []),
+    ...(gallery ?? []),
+    ...(variants?.map(({ image }) => image) ?? []),
+  ];
+  const result = await runTransaction(database, async (transaction) => {
+    const publicRef = doc(database, 'products', id);
+    const privateRef = doc(database, 'productWorkspace', id);
+    const [publicDoc, privateDoc] = await Promise.all([
+      transaction.get(publicRef),
+      transaction.get(privateRef),
+    ]);
+    if (creating && (publicDoc.exists() || privateDoc.exists()))
+      throw new Error('Product already exists');
+    if (!creating && !publicDoc.exists() && !privateDoc.exists())
+      throw new Error('Product not found');
+    const current = (publicDoc.exists() ? publicDoc.data() : privateDoc.data()) as
+      Omit<Product, 'id'> | undefined;
+    const changes = Object.fromEntries(
+      Object.entries(patch).filter(([key, value]) => !(key === 'slug' && value === '')),
+    ) as ProductPatch;
+    const data = {
+      ...current,
+      ...(current
+        ? { price: current.status ? current.price : catalogPrice(current.slug, current.price) }
+        : {}),
+      ...changes,
+      id,
+      createdAt: current?.createdAt ?? new Date().toISOString(),
+      status: patch.status ?? current?.status ?? (creating ? 'draft' : 'published'),
+      ...(prepared ? { imageUrl: prepared.url } : {}),
+      ...(gallery ? { gallery: gallery.map((image) => image.url) } : {}),
+      ...(variants
+        ? { variants: variants.map(({ variant, image }) => ({ ...variant, imageUrl: image.url })) }
+        : {}),
+    } as Product;
+    if (patch.price !== undefined && !variants && data.variants?.length) {
+      const difference = patch.price - Math.min(...data.variants.map((variant) => variant.price));
+      data.variants = data.variants.map((variant) => ({
+        ...variant,
+        price: Math.max(0, variant.price + difference),
+      }));
+    }
+    if (data.variants?.length)
+      data.price = Math.min(...data.variants.map((variant) => variant.price));
+    if (!(await transaction.get(doc(database, 'categories', data.category))).exists())
+      throw new Error('Unknown category');
+    const base = toSlug(data.slug || data.name.en);
+    if (!base) throw new Error('Invalid product slug');
+    let slug = base;
+    if (data.status === 'published') {
+      for (let suffix = 1; suffix < 1000; suffix += 1) {
+        slug = suffix === 1 ? base : `${base}-${String(suffix)}`;
+        const mapping = await transaction.get(doc(database, 'productSlugs', slug));
+        if (!mapping.exists() || mapping.data().productId === id) break;
+        if (!creating || suffix === 999) throw new Error('Product slug already exists');
+      }
+    }
+    data.slug = slug;
+    const storedImages = await Promise.all(
+      images.map(async (image) => {
+        const ref = image.hash ? doc(database, 'images', image.hash) : null;
+        return { image, ref, exists: ref ? (await transaction.get(ref)).exists() : true };
+      }),
+    );
+    for (const { image, ref, exists } of storedImages) {
+      if (ref && !exists)
+        transaction.set(ref, {
+          bytes: image.bytes,
+          contentType: image.contentType,
+          createdAt: new Date().toISOString(),
+        });
+    }
+    const { id: productId, ...stored } = data;
+    if (publicDoc.exists() && (data.status !== 'published' || current?.slug !== slug)) {
+      transaction.delete(doc(database, 'productSlugs', String(current?.slug)));
+    }
+    if (data.status === 'published') {
+      transaction.set(publicRef, stored);
+      if (privateDoc.exists()) transaction.delete(privateRef);
+      transaction.set(doc(database, 'productSlugs', slug), { productId });
+    } else {
+      transaction.set(privateRef, stored);
+      if (publicDoc.exists()) transaction.delete(publicRef);
+    }
+    return data;
+  });
+  return productFrom(result.id, result);
+};
+
+const createProduct = (draft: ProductDraft): Promise<Product> =>
+  saveProduct(doc(collection(database, 'products')).id, draft, true);
+const updateProduct = (id: string, patch: ProductPatch): Promise<Product> =>
+  saveProduct(id, patch, false);
+
+const deleteProduct = async (id: string): Promise<void> =>
+  runTransaction(database, async (transaction) => {
+    const reference = doc(database, 'productWorkspace', id);
+    const snapshot = await transaction.get(reference);
+    if (!snapshot.exists() || snapshot.data().status !== 'archived')
+      throw new Error('Archive before deleting');
+    transaction.delete(reference);
+  });
+
+export const runFirestoreRequest = async (input: string | FetchArgs): Promise<unknown> => {
+  const args = typeof input === 'string' ? { url: input, method: 'GET' } : input;
+  const method = args.method ?? 'GET';
+  const adminMatch = /^\/admin\/products\/([^/]+)$/.exec(args.url);
+  if (method === 'GET' && args.url === '/admin/products') return listAdminProducts();
+  if (method === 'GET' && adminMatch?.[1])
+    return findAdminProduct(decodeURIComponent(adminMatch[1]));
+  const productMatch = /^\/products\/([^/]+)$/.exec(args.url);
+  if (method === 'GET' && args.url === '/products') return listProducts(asParams(args.params));
+  if (method === 'GET' && productMatch?.[1])
+    return findProduct(decodeURIComponent(productMatch[1]));
+  if (method === 'POST' && args.url === '/products')
+    return createProduct(args.body as ProductDraft);
+  if (method === 'PATCH' && productMatch?.[1])
+    return updateProduct(decodeURIComponent(productMatch[1]), args.body as ProductPatch);
+  if (method === 'DELETE' && productMatch?.[1]) {
+    await deleteProduct(decodeURIComponent(productMatch[1]));
+    return undefined;
+  }
+  if (method === 'GET' && args.url === '/categories') {
+    const snapshots = await getDocs(collection(database, 'categories'));
+    if (snapshots.empty) return seed.categories;
+    return snapshots.docs.map((snapshot) => {
+      const data = snapshot.data() as Record<string, unknown> & { id?: string };
+      return { ...data, id: data.id ?? snapshot.id };
+    });
+  }
+  if (method === 'GET' && args.url === '/reviews') {
+    const productId = asParams(args.params).get('productId');
+    const snapshots = await getDocs(collection(database, 'reviews'));
+    const reviews = snapshots.empty
+      ? seed.reviews
+      : snapshots.docs.map((snapshot) => {
+          const data = snapshot.data() as Record<string, unknown> & { productId?: string };
+          return { ...data, id: snapshot.id };
+        });
+    return reviews.filter((review) => !productId || review.productId === productId);
+  }
+  throw new Error(`Unsupported Firestore request: ${method} ${args.url}`);
+};
+
+export const ensureAdminSession = async (
+  email: string | null,
+  emailVerified: boolean,
+): Promise<void> => {
+  if (!emailVerified || email?.toLowerCase() !== ADMIN_EMAIL) throw new Error('Forbidden');
+  const marker = doc(database, 'metadata', 'initial-seed');
+  if (!(await getDoc(marker)).exists()) {
+    const records = [
+      ...seed.categories.map((item) => ['categories', item.slug, item] as const),
+      ...seed.products.flatMap(({ id, ...product }) => [
+        ['products', id, product] as const,
+        ['productSlugs', product.slug, { productId: id }] as const,
+      ]),
+      ...seed.reviews.map(({ id, ...review }) => ['reviews', id, review] as const),
+    ];
+    const existing = await Promise.all(
+      records.map(([name, id]) => getDoc(doc(database, name, id))),
+    );
+    const batch = writeBatch(database);
+    records.forEach(([name, id, data], index) => {
+      if (!existing[index]?.exists()) batch.set(doc(database, name, id), data);
+    });
+    batch.set(marker, { completedAt: new Date().toISOString() });
+    await batch.commit();
+  }
+
+  const careMarker = doc(database, 'metadata', 'care-specifications-v1');
+  if (!(await getDoc(careMarker)).exists()) {
+    const references = seed.products.flatMap(({ id, care }) =>
+      ['products', 'productWorkspace'].map((collectionName) => ({
+        reference: doc(database, collectionName, id),
+        care,
+      })),
+    );
+    const snapshots = await Promise.all(references.map(({ reference }) => getDoc(reference)));
+    const batch = writeBatch(database);
+    references.forEach(({ reference, care }, index) => {
+      if (snapshots[index]?.exists() && !snapshots[index].data().care)
+        batch.update(reference, { care });
+    });
+    batch.set(careMarker, { completedAt: new Date().toISOString() });
+    await batch.commit();
+  }
+
+  const commerceMarker = doc(database, 'metadata', 'product-options-delivery-v1');
+  if ((await getDoc(commerceMarker)).exists()) return;
+  const commerceReferences = seed.products.flatMap((product) =>
+    ['products', 'productWorkspace'].map((name) => ({
+      reference: doc(database, name, product.id),
+      product,
+    })),
+  );
+  const commerceSnapshots = await Promise.all(
+    commerceReferences.map(({ reference }) => getDoc(reference)),
+  );
+  const commerceBatch = writeBatch(database);
+  commerceReferences.forEach(({ reference, product }, index) => {
+    const snapshot = commerceSnapshots[index];
+    if (!snapshot?.exists()) return;
+    const data = snapshot.data() as Omit<Product, 'id'>;
+    const price = data.status ? data.price : catalogPrice(data.slug, data.price);
+    const changes: ProductPatch = {};
+    if (data.variants === undefined)
+      changes.variants = (product.variants as ProductVariant[]).map((variant) => ({
+        ...variant,
+        price: Math.max(0, variant.price + price - product.price),
+      }));
+    if (data.delivery === undefined) changes.delivery = product.delivery as ProductDelivery;
+    if (Object.keys(changes).length) commerceBatch.update(reference, changes);
+  });
+  commerceBatch.set(commerceMarker, { completedAt: new Date().toISOString() });
+  await commerceBatch.commit();
+};
+
+export const subscribeInFirestore = async (value: string): Promise<void> => {
+  const email = value.trim().toLowerCase();
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(email));
+  const id = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  await setDoc(doc(database, 'newsletterSubscribers', id), {
+    email,
+    subscribedAt: new Date().toISOString(),
+  });
+};
